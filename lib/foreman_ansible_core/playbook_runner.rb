@@ -1,6 +1,8 @@
 require 'foreman_tasks_core/runner/command_runner'
 require_relative 'command_creator'
 require 'tmpdir'
+require 'net/ssh'
+require 'open3'
 
 module ForemanAnsibleCore
   # Implements ForemanTasksCore::Runner::Base interface for running
@@ -11,6 +13,7 @@ module ForemanAnsibleCore
     def initialize(inventory, playbook, options = {})
       super
       @inventory = inventory
+      add_to_known_hosts unless found_in_known_hosts?
       @playbook  = playbook
       @options   = options
       initialize_dirs
@@ -93,6 +96,42 @@ module ForemanAnsibleCore
       raise "Ansible dir #{ansible_dir} does not exist" unless
         !ansible_dir.nil? && File.exist?(ansible_dir)
       @ansible_dir = ansible_dir
+    end
+
+    def found_in_known_hosts?
+      JSON.parse(@inventory)['all']['hosts'].each do |host|
+        return false if Net::SSH::KnownHosts.search_for(host).empty?
+      end
+      true
+    end
+
+    def add_to_known_hosts
+      logger.warn('[foreman_ansible] - Host not found in known_hosts')
+      JSON.parse(@inventory)['all']['hosts'].each do |host|
+        stdout, stderr, status = Open3.capture3("ssh-keyscan #{host}")
+        if status.success?
+          # Add key to known_hosts
+          host_keys = stdout.split("\n")
+          Net::SSH::KnownHosts.hostfiles({}).each do |known_hosts_file|
+            # '~' cannot be properly substituted in Ruby as there's no shell
+            known_hosts_file.sub!('~', Dir.home)
+            host_keys.each do |host_key|
+              File.write(
+                known_hosts_file,
+                "\n#{host_key}\n",
+                File.size(known_hosts_file),
+                mode: 'a'
+              )
+            rescue SystemCallError => e
+              logger.error('[foreman_ansible] - Failed to save host key for '\
+                           "#{host} in #{known_hosts_file}: #{e}")
+            end
+          end
+        else
+          logger.error("[foreman_ansible] - RC #{status.to_i}: #{stderr}")
+        end
+        logger.warn("[foreman_ansible] - Added host key #{host} to known_hosts")
+      end
     end
   end
 end
